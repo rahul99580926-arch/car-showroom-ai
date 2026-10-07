@@ -3,5 +3,3 @@ PyMuPDF>=1.28,<2
 Pillow>=12,<13
 opencv-python-headless>=4.10,<5
 numpy>=2,<3
-gunicorn
-reportlab

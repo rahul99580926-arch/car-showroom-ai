@@ -8,12 +8,10 @@ import re
 import io
 from pathlib import Path
 
-import pymupdf
+import fitz
 from PIL import Image, ImageOps
 import cv2
 import numpy as np
-from reportlab.pdfgen import canvas
-from reportlab.lib.utils import ImageReader
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -49,44 +47,32 @@ def clean_image(path):
 
 
 def extract_pdf(pdf_path, output_folder):
-    """Extract every usable image from a PDF; if a page has no extractable
-    images, render the whole page so the user always gets a JPG."""
     output_folder.mkdir(parents=True, exist_ok=True)
-    doc = pymupdf.open(pdf_path)
+    doc = fitz.open(pdf_path)
     count = 0
-    for page_index, page in enumerate(doc, start=1):
-        extracted_on_page = 0
-        seen_xrefs = set()
-        for image in page.get_images(full=True):
-            xref = image[0]
-            if xref in seen_xrefs:
-                continue
-            seen_xrefs.add(xref)
-            try:
-                data = doc.extract_image(xref)
-                raw_bytes = data.get("image")
-                if not raw_bytes:
-                    continue
+    for page in doc:
+        images = page.get_images(full=True)
+        if images:
+            for image in images:
+                data = doc.extract_image(image[0])
+                ext = data.get("ext", "jpg")
                 count += 1
+                raw = output_folder / f"_raw_{count}.{ext}"
                 out = output_folder / f"car_photo_{count}.jpg"
-                with Image.open(io.BytesIO(raw_bytes)) as im:
-                    im = ImageOps.exif_transpose(im).convert("RGB")
+                raw.write_bytes(data["image"])
+                try:
+                    im = Image.open(raw).convert("RGB")
+                    im = ImageOps.exif_transpose(im)
                     im.thumbnail((2400, 2400), Image.Resampling.LANCZOS)
                     im.save(out, "JPEG", quality=92, optimize=True)
-                extracted_on_page += 1
-            except Exception:
-                continue
-
-        # Scanned PDFs or pages whose pictures cannot be extracted: render page.
-        if extracted_on_page == 0:
-            pix = page.get_pixmap(matrix=pymupdf.Matrix(2.0, 2.0), alpha=False)
+                finally:
+                    raw.unlink(missing_ok=True)
+        else:
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.7, 1.7), alpha=False)
             count += 1
             out = output_folder / f"car_photo_{count}.jpg"
             pix.save(str(out))
-            try:
-                clean_image(out)
-            except Exception:
-                pass
+            clean_image(out)
     doc.close()
     return count
 
@@ -185,10 +171,9 @@ def apply_regions(image_path, regions, logo_path=None):
         box=_pct_box_to_px(r,iw,ih)
         x1,y1,x2,y2=box; mask[y1:y2,x1:x2]=255; boxes.append(box)
     if not boxes: return False
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    mask = cv2.dilate(mask, kernel, iterations=2)
-    # Use Telea for detailed surfaces; Navier-Stokes fallback is applied if needed.
-    result=cv2.inpaint(img,mask,13,cv2.INPAINT_TELEA)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask = cv2.dilate(mask, kernel, iterations=1)
+    result=cv2.inpaint(img,mask,9,cv2.INPAINT_NS)
     for box in boxes: result=_place_logo(result,logo_path,box)
     cv2.imwrite(str(image_path),result,[int(cv2.IMWRITE_JPEG_QUALITY),92]); return True
 
@@ -227,9 +212,9 @@ def apply_batch_auto(folder, regions, logo_path=None):
         mask=np.zeros((ih2,iw2),dtype=np.uint8)
         for x1,y1,x2,y2 in boxes:
             x1=max(0,min(x1,iw2-1)); y1=max(0,min(y1,ih2-1)); x2=max(x1+1,min(x2,iw2)); y2=max(y1+1,min(y2,ih2)); mask[y1:y2,x1:x2]=255
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-        mask = cv2.dilate(mask, kernel, iterations=2)
-        result=cv2.inpaint(img,mask,13,cv2.INPAINT_TELEA)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        mask = cv2.dilate(mask, kernel, iterations=1)
+        result=cv2.inpaint(img,mask,9,cv2.INPAINT_NS)
         for box in boxes: result=_place_logo(result,logo_path,box)
         cv2.imwrite(str(p),result,[int(cv2.IMWRITE_JPEG_QUALITY),92]); processed+=1
     return processed, detected
@@ -324,30 +309,6 @@ def cleanup_single(folder):
 @app.route("/image/<folder>/<filename>")
 def image(folder, filename):
     return send_from_directory(UPLOAD_DIR / secure_filename(folder), secure_filename(filename))
-
-
-@app.route("/download-pdf/<folder>")
-def download_pdf(folder):
-    folder = secure_filename(folder)
-    path = UPLOAD_DIR / folder
-    if not path.is_dir(): abort(404)
-    images = image_list(path)
-    if not images: abort(404)
-    pdf_bytes = io.BytesIO()
-    c = canvas.Canvas(pdf_bytes)
-    for img_path in images:
-        with Image.open(img_path) as im:
-            im = ImageOps.exif_transpose(im).convert("RGB")
-            w, h = im.size
-            page_w, page_h = 595, 842
-            scale = min((page_w-40)/w, (page_h-40)/h)
-            dw, dh = w*scale, h*scale
-            x, y = (page_w-dw)/2, (page_h-dh)/2
-            c.drawImage(ImageReader(im), x, y, width=dw, height=dh, preserveAspectRatio=True, mask='auto')
-            c.showPage()
-    c.save()
-    pdf_bytes.seek(0)
-    return send_file(pdf_bytes, mimetype="application/pdf", as_attachment=True, download_name="cleaned_car_photos.pdf")
 
 
 @app.route("/download/<folder>/<filename>")
